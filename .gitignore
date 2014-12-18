@@ -1,0 +1,6 @@
+build/
+dist/
+starcheat/__pycache__/
+.projectile
+.DS_Store
+*.org

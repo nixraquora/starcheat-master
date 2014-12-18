@@ -1,0 +1,3 @@
+[submodule "starcheat/starbound"]
+	path = starcheat/starbound
+	url = https://github.com/blixt/py-starbound.git

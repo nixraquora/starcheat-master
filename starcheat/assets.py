@@ -1,0 +1,1047 @@
+"""
+Module for reading and indexing Starbound assets
+"""
+
+# TODO: this file should end up similar to save_file in that it has no external
+# deps. need to:
+# - custom exception classes
+
+import os, json, re, sqlite3, logging, random
+from io import BytesIO
+
+from PIL import Image
+
+import starbound
+import starbound.btreedb4
+
+# Regular expression for comments
+comment_re = re.compile(
+    '("(\\[\s\S]|[^"])*")|((^)?[^\S\n]*/(?:\*(.*?)\*/[^\S\n]*|/[^\n]*)($)?)',
+    re.DOTALL | re.MULTILINE
+)
+
+ignore_assets = re.compile(".*\.(db|ds_store|ini|psd)", re.IGNORECASE)
+ignore_items = re.compile(".*\.(png|config|frames)", re.IGNORECASE)
+
+def parse_json(content, key):
+    if key.endswith(".grapplinghook"):
+        content = content.replace("[-.", "[-0.")
+    decoder = json.JSONDecoder(None,None,None,None,False,None)
+    # Looking for comments
+    # Allows for // inside of the " " JSON data
+    content = comment_re.sub(lambda m: m.group(1) or '', content)
+
+    # Return json file
+    return decoder.decode(content)
+
+def load_asset_file(filename):
+    with open(filename) as f:
+        content = ''.join(f.readlines())
+        return parse_json(content, filename)
+
+def read_default_color(species_data):
+    color = []
+    if type(species_data[0]) is str:
+        return []
+    for group in species_data[0].keys():
+        color.append([group, species_data[0][group]])
+    return color
+
+def asset_category(keyStr):
+    """
+    Returns the asset key extension as the category
+    :param keyStr: the asset's key.
+    """
+    extension = os.path.splitext(keyStr)[1]
+    if extension == '':
+        return ''
+    else:
+        return extension[1:] #removes the . from the extension
+
+class Assets():
+    def __init__(self, db_file, starbound_folder):
+        self.starbound_folder = starbound_folder
+        self.db = sqlite3.connect(db_file)
+        self.vanilla_assets = os.path.join(self.starbound_folder, "assets", "packed.pak")
+
+    def init_db(self):
+        c = self.db.cursor()
+        c.execute("drop table if exists assets")
+        c.execute("""create table assets
+        (key text, path text, type text, category text, name text, desc text)""")
+        self.db.commit()
+
+    def total_indexed(self):
+        c = self.db.cursor()
+        try:
+            c.execute("select count(*) from assets")
+        except sqlite3.OperationalError:
+            # database may be corrupt
+            return 0
+        return c.fetchone()[0]
+
+    def create_index(self, asset_files=False):
+        if not asset_files:
+            asset_files = self.find_assets()
+
+        blueprints = Blueprints(self)
+        items = Items(self)
+        species = Species(self)
+        monsters = Monsters(self)
+        techs = Techs(self)
+
+        new_index_query = "insert into assets values (?, ?, ?, ?, ?, ?)"
+        c = self.db.cursor()
+
+        for asset in asset_files:
+            yield (asset[0], asset[1])
+
+            tmp_data = None
+
+            if asset_category(asset[0]) != '':
+                if asset[0].endswith(".png"):
+                    tmp_data = (asset[0], asset[1], "image", "", "", "")
+                elif blueprints.is_blueprint(asset[0]):
+                    tmp_data = blueprints.index_data(asset)
+                elif species.is_species(asset[0]):
+                    tmp_data = species.index_data(asset)
+                elif items.is_item(asset[0]):
+                    tmp_data = items.index_data(asset)
+                elif monsters.is_monster(asset[0]):
+                    tmp_data = monsters.index_data(asset)
+                elif techs.is_tech(asset[0]):
+                    tmp_data = techs.index_data(asset)
+            else:
+                logging.warning("Skipping invalid asset (no file extension) %s in %s" % (asset[0], asset[1]))
+
+            if tmp_data != None:
+                c.execute(new_index_query, tmp_data)
+
+        self.db.commit()
+
+    def find_assets(self):
+        """Scan all Starbound assets and return key/file list.
+
+        Includes mod files, .pak files.
+
+        """
+        index = []
+        vanilla_path = os.path.join(self.starbound_folder, "assets")
+        vanilla_assets = self.scan_asset_folder(vanilla_path)
+        [index.append(x) for x in vanilla_assets]
+
+        mods_path = os.path.join(self.starbound_folder, "mods")
+        if not os.path.isdir(mods_path):
+            return index
+
+        for mod in os.listdir(mods_path):
+            mod_folder = os.path.join(mods_path, mod)
+            if os.path.isdir(mod_folder):
+                mod_assets = self.scan_asset_folder(mod_folder)
+                [index.append(x) for x in mod_assets]
+            elif mod_folder.endswith(".modpak"):
+                mod_assets = self.scan_modpak(mod_folder)
+                [index.append(x) for x in mod_assets]
+        return index
+
+    def scan_modpak(self, modpak):
+        # TODO: may need support for reading the mod folder from the pakinfo file
+        db = starbound.open_file(modpak)
+        index = [(x, modpak) for x in db.get_index()]
+        return index
+
+    def scan_asset_folder(self, folder):
+        pak_path = os.path.join(folder, "packed.pak")
+
+        if os.path.isfile(pak_path):
+            db = starbound.open_file(pak_path)
+            index = [(x, pak_path) for x in db.get_index()]
+            return index
+        else:
+            # old style, probably a mod
+            index = []
+            mod_assets = None
+            files = os.listdir(folder)
+
+            logging.debug(files)
+
+            # TODO: would like to keep this idea but moved to modpak specific function
+            found_mod_info = False #will need more logic to handle .modpack with modinfo inside.
+
+            for f in files:
+                if f.endswith(".modinfo"):
+                    modinfo = os.path.join(folder, f)
+                    try:
+                        modinfo_data = load_asset_file(modinfo)
+                        path = modinfo_data["path"]
+                        mod_assets = os.path.join(folder, path)
+                        found_mod_info = True
+                    except ValueError:
+                        # really old mods
+                        folder = os.path.join(folder, "assets")
+                        if os.path.isdir(folder):
+                            mod_assets = folder
+            logging.debug(mod_assets)
+
+            if mod_assets == None:
+                return index
+            elif found_mod_info and self.is_packed_file(mod_assets):
+                # TODO: make a .pak scanner function that works for vanilla and mods
+                pak_path = os.path.normpath(mod_assets)
+                db = starbound.open_file(pak_path)
+                for x in db.get_index():
+                    # removes thumbs.db etc from user pak files
+                    if re.match(ignore_assets, x) == None:
+                        index.append((x, pak_path))
+                return index
+            elif not os.path.isdir(mod_assets):
+                return index
+
+            # now we can scan!
+            for root, dirs, files in os.walk(mod_assets):
+                for f in files:
+                    if re.match(ignore_assets, f) == None:
+                        asset_folder = os.path.normpath(mod_assets)
+                        asset_file = os.path.normpath(os.path.join(root.replace(folder, ""), f))
+                        index.append((asset_file, asset_folder))
+            return index
+
+
+    def is_packed_file(self, path):
+        """
+            Returns true if the asset path is a file (will be assuming from the index that it is a packed type)
+            Returns false if the asset path is a folder (legacy/non-packed mods)
+        """
+        return os.path.isfile(path)
+
+    def read(self, key, path, image=False):
+        if self.is_packed_file(path):
+            key = key.lower()
+            db = starbound.open_file(path)
+
+            try:
+                data = db.get(key)
+            except KeyError:
+                if image and path != self.vanilla_assets:
+                    return self.read(key, self.vanilla_assets, image)
+                else:
+                    logging.exception("Unable to read db asset '%s' from '%s'" % (key, path))
+                    return None
+            if image:
+                return data
+            else:
+                try:
+                    asset = parse_json(data.decode("utf-8"), key)
+                    return asset
+                except ValueError:
+                    logging.exception("Unable to read db asset '%s' from '%s'" % (key, path))
+                    return None
+        else:
+            asset_file = os.path.join(path, key[1:])
+            try:
+                if image:
+                    return open(asset_file, "rb").read()
+                else:
+                    asset = load_asset_file(asset_file)
+                    return asset
+            except (FileNotFoundError, ValueError):
+                if image and path != self.vanilla_assets:
+                    if self.is_packed_file(self.vanilla_assets):
+                        return self.read(key.replace("\\", "/"), self.vanilla_assets, image)
+                    else:
+                        return self.read(key, self.vanilla_assets, image)
+                else:
+                    logging.exception("Unable to read asset file '%s' from '%s'" % (key, path))
+                    return None
+
+    def blueprints(self):
+        return Blueprints(self)
+
+    def items(self):
+        return Items(self)
+
+    def species(self):
+        return Species(self)
+
+    def player(self):
+        return Player(self)
+
+    def monsters(self):
+        return Monsters(self)
+
+    def techs(self):
+        return Techs(self)
+
+    def get_all(self, asset_type):
+        c = self.assets.db.cursor()
+        c.execute("select * from assets where type = ? order by name collate nocase", (asset_type,))
+        return c.fetchall()
+
+    def get_categories(self, asset_type):
+        c = self.assets.db.cursor()
+        c.execute("select distinct category from assets where type = ? order by category", (asset_type,))
+        return [x[0] for x in c.fetchall()]
+
+    def filter(self, asset_type, category, name):
+        if category == "<all>":
+            category = "%"
+        name = "%" + name + "%"
+        c = self.db.cursor()
+        q = """select * from assets where type = ? and category like ?
+        and (name like ? or desc like ?) order by desc, name collate nocase"""
+        c.execute(q, (asset_type, category, name, name))
+        result = c.fetchall()
+        return result
+
+    def get_total(self, asset_type):
+        c = self.assets.db.cursor()
+        c.execute("select count(*) from assets where type = ?", (asset_type))
+        return c.fetchone()[0]
+
+    def missing_icon(self):
+        return self.read("/interface/inventory/x.png", self.vanilla_assets, image=True)
+
+    def get_mods(self):
+        """Return a list of all unique mod paths."""
+        c = self.db.cursor()
+        c.execute("select distinct path from assets order by category")
+        return [x[0].replace(self.starbound_folder,"") for x in c.fetchall()][1:]
+
+class Blueprints():
+    def __init__(self, assets):
+        self.assets = assets
+        self.starbound_folder = assets.starbound_folder
+
+    def is_blueprint(self, key):
+        if key.endswith(".recipe"):
+            return True
+        else:
+            return False
+
+    def index_data(self, asset):
+        key = asset[0]
+        path = asset[1]
+        name = os.path.basename(asset[0]).split(".")[0]
+        asset_type = "blueprint"
+        asset_data = self.assets.read(key, path)
+
+        if asset_data == None: return
+
+        try:
+            category = asset_data["groups"][1]
+        except (KeyError, IndexError):
+            category = "other"
+
+        return (key, path, asset_type, category, name, "")
+
+    def get_all_blueprints(self):
+        """Return a list of every indexed blueprints."""
+        c = self.assets.db.cursor()
+        c.execute("select * from assets where type = 'blueprint' order by name collate nocase")
+        return c.fetchall()
+
+    def get_categories(self):
+        """Return a list of all unique blueprint categories."""
+        c = self.assets.db.cursor()
+        c.execute("select distinct category from assets where type = 'blueprint' order by category")
+        return [x[0] for x in c.fetchall()]
+
+    def filter_blueprints(self, category, name):
+        """Filter blueprints based on category and name."""
+        return self.assets.filter("blueprint", category, name)
+
+class Items():
+    def __init__(self, assets):
+        self.assets = assets
+        self.starbound_folder = assets.starbound_folder
+
+    def is_item(self, key):
+        if key.endswith(".object"):
+            return True
+        elif key.endswith(".techitem"):
+            return True
+        elif key.endswith(".codexitem"):
+            return True
+        elif key.startswith("items", 1) and re.match(ignore_items, key) == None:
+            return True
+        else:
+            return False
+
+    def index_data(self, asset):
+        key = asset[0]
+        path = asset[1]
+        asset_type = "item"
+        category = asset_category(key)
+        asset_data = self.assets.read(key, path)
+
+        if asset_data == None: return
+
+        name = False
+        item_name_keys = ["itemName", "name", "objectName"]
+        for item_name in item_name_keys:
+            try:
+                name = asset_data[item_name]
+            except KeyError:
+                pass
+
+        desc = ""
+        if "shortdescription" in asset_data:
+            desc = asset_data["shortdescription"]
+
+        if not name:
+            logging.warning("Skipping invalid item asset (no name set) %s in %s" % (key, path))
+            return
+        else:
+            if key.endswith(".techitem"):
+                name = name + "-chip"
+            return (key, path, asset_type, category, name, desc)
+
+    def filter_items(self, category, name):
+        """Search for indexed items based on name and category."""
+        return self.assets.filter("item", category, name)
+
+    def get_all_items(self):
+        """Return a list of every indexed item."""
+        c = self.assets.db.cursor()
+        c.execute("select * from assets where type = 'item' order by name collate nocase")
+        return c.fetchall()
+
+    def get_item(self, name):
+        """
+        Find the first hit in the DB for a given item name, return the
+        parsed asset file and location.
+        """
+        c = self.assets.db.cursor()
+        c.execute("select key, path, desc from assets where type = 'item' and name = ?", (name,))
+        meta = c.fetchone()
+        item = self.assets.read(meta[0], meta[1])
+        return item, meta[0], meta[1], meta[2]
+
+    def get_categories(self):
+        """Return a list of all unique indexed item categories."""
+        c = self.assets.db.cursor()
+        c.execute("select distinct category from assets where type = 'item' order by category")
+        return c.fetchall()
+
+    def get_item_icon(self, name):
+        """Return the path and spritesheet offset of a given item name."""
+        try:
+            item = self.get_item(name)
+            icon_file = item[0]["inventoryIcon"]
+            icon = icon_file.split(':')
+            if len(icon) < 2:
+                icon = [icon[0], 0]
+        except (TypeError, KeyError):
+            return None
+
+        if icon[0][0] != "/":
+            icon[0] = os.path.dirname(item[1]) + "/" + icon[0]
+
+        icon_data = self.assets.read(icon[0], item[2], image=True)
+        if icon_data == None:
+            return None
+
+        item_icon = Image.open(BytesIO(icon_data))
+
+        icon_type = str(icon[1])
+        if icon_type.startswith("chest"):
+            item_icon = item_icon.crop((16, 0, 16+16, 16))
+        elif icon_type.startswith("pants"):
+            item_icon = item_icon.crop((32, 0, 32+16, 16))
+        else:
+            item_icon = item_icon.crop((0, 0, 16, 16))
+
+        inv_icon = Image.new("RGBA", (16,16))
+        inv_icon.paste(item_icon)
+        return inv_icon
+
+    def get_item_image(self, name):
+        """Return a vaild item image path for given item name."""
+        # TODO: support for frame selectors
+        # TODO: support for generated item images
+        if name == "generatedsword":
+            return Image.open(BytesIO(self.sword_icon())).convert("RGBA")
+        elif name == "generatedshield":
+            return Image.open(BytesIO(self.shield_icon())).convert("RGBA")
+        elif name == "generatedgun":
+            return Image.open(BytesIO(self.sword_icon())).convert("RGBA")
+        elif name == "sapling":
+            return Image.open(BytesIO(self.sapling_icon())).convert("RGBA")
+
+        try:
+            item = self.get_item(name)
+            icon_file = item[0]["image"]
+            icon = icon_file.split(':')
+            icon = icon[0]
+        except (KeyError, TypeError):
+            logging.warning("No image key for "+name)
+            return None
+
+        if icon[0] != "/":
+            icon = os.path.dirname(item[1]) + "/" + icon
+
+        icon_data = self.assets.read(icon, item[2], image=True)
+
+        if icon_data == None:
+            logging.warning("Unable to read %s from %s" % (icon, item[2]))
+            return None
+
+        item_image = Image.open(BytesIO(icon_data)).convert("RGBA")
+        return item_image
+
+    def missing_icon(self):
+        """Return the image data for the default inventory placeholder icon."""
+        return self.assets.read("/interface/inventory/x.png", self.assets.vanilla_assets, image=True)
+
+    def sword_icon(self):
+        return self.assets.read("/interface/inventory/sword.png", self.assets.vanilla_assets, image=True)
+
+    def shield_icon(self):
+        return self.assets.read("/interface/inventory/shield.png", self.assets.vanilla_assets, image=True)
+
+    def sapling_icon(self):
+        return self.assets.read("/objects/generic/sapling/saplingicon.png", self.assets.vanilla_assets,
+                                image=True)
+
+    def generate_gun(self, item):
+        image_folder = item[0]["name"].replace(item[0]["rarity"].lower(), "")
+        image_folder = image_folder.replace("plasma", "")
+        generated_gun = {
+            "itemName": "generatedgun",
+            "level": 1.0,
+            "levelScale": 2.0,
+            "projectileType": "piercingbullet",
+            "rarity": "common",
+            "recoilTime": 0.1,
+            "shortdescription": "Cheater's Remorse",
+            "spread": 2,
+            "twoHanded": True,
+            "weaponType": "Sniper Rifle",
+            "classMultiplier": 1.0,
+            "projectile": { "level": 1.0, "power": 2.0 },
+            "firePosition": [0.0, 0.0],
+            "fireTime": 0.5,
+            "generated": True,
+            "handPosition": [-5.0, -2.0],
+            "inspectionKind": "gun",
+            "muzzleEffect": {
+                "animation": "/animations/muzzleflash/bulletmuzzle3/bulletmuzzle3.animation",
+                "fireSound": [ { "file": "/sfx/gun/sniper3.wav" } ]
+            },
+            "drawables": [
+                {
+                    "image": "/items/guns/randomgenerated/%s/butt/1.png" % image_folder,
+                    "position": [ -8.0, 0.0 ]
+                },
+                {
+                    "image": "/items/guns/randomgenerated/%s/middle/1.png" % image_folder,
+                    "position": [ 0.0, 0.0 ]
+                },
+                {
+                    "image": "/items/guns/randomgenerated/%s/barrel/1.png" % image_folder,
+                    "position": [ 12.0, 0.0 ]
+                }
+            ],
+            "inventoryIcon": [
+                {
+                    "image": "/items/guns/randomgenerated/%s/butt/1.png" % image_folder,
+                    "position": [ -8.0, 0.0 ]
+                },
+                {
+                    "image": "/items/guns/randomgenerated/%s/middle/1.png" % image_folder,
+                    "position": [ 0.0, 0.0 ]
+                },
+                {
+                    "image": "/items/guns/randomgenerated/%s/barrel/1.png" % image_folder,
+                    "position": [ 12.0, 0.0 ]
+                }
+            ]
+        }
+
+        if "rarity" in item[0]:
+            generated_gun["rarity"] = item[0]["rarity"]
+
+        if "inspectionKind" in item[0]:
+            generated_gun["inspectionKind"] = item[0]["inspectionKind"]
+
+        if "handPosition" in item[0]:
+            generated_gun["handPosition"] = [float(item[0]["handPosition"][0]),
+                                             float(item[0]["handPosition"][1])]
+
+        #if "firePosition" in item[0]:
+        #    generated_gun["firePosition"] = [float(item[0]["firePosition"][0]),
+        #                                     float(item[0]["firePosition"][1])]
+
+        if "rateOfFire" in item[0]:
+            generated_gun["fireTime"] = float(item[0]["rateOfFire"][0])
+
+        if "recoilTime" in item[0]:
+            generated_gun["fireTime"] = float(item[0]["recoilTime"])
+
+        if "weaponType" in item[0]:
+            generated_gun["weaponType"] = item[0]["weaponType"]
+            generated_gun["shortdescription"] = "Cheater's " + item[0]["weaponType"]
+
+        if "spread" in item[0]:
+            generated_gun["spread"] = float(item[0]["spread"][0])
+
+        if "muzzleFlashes" in item[0] and "fireSound" in item[0]:
+            generated_gun["muzzleEffect"] = {
+                "animation": item[0]["muzzleFlashes"][0],
+                "fireSound": [ { "file": item[0]["fireSound"][0] } ]
+            }
+
+        if "projectileTypes" in item[0]:
+            generated_gun["projectileType"] = item[0]["projectileTypes"][0]
+
+        return generated_gun
+
+    def generate_sword(self, item):
+        try:
+            image_folder = item[0]["name"].replace(item[0]["rarity"].lower(), "")
+        except KeyError:
+            image_folder = item[0]["name"]
+        image_folder = re.sub("(uncommon|common|crappy)", "", image_folder)
+        generated_sword = {
+            "generated": True,
+            "inspectionKind": "sword",
+            "itemName": "generatedsword",
+            "shortdescription": "Immersion Ruiner",
+            "fireAfterWindup": True,
+            "fireTime": 0.5,
+            "level": 1.0,
+            "levelScale": 2.0,
+            "rarity": "common",
+            "firePosition": [ 12.5, 3.0 ],
+            "soundEffect": { "fireSound": [ { "file": "/sfx/melee/swing_hammer.wav" } ] },
+            "weaponType": "uncommontier2hammer",
+            "drawables": [ { "image": "/items/swords/randomgenerated/%s/handle/1.png" % image_folder },
+                           { "image": "/items/swords/randomgenerated/%s/blade/1.png" % image_folder } ],
+            "inventoryIcon": [ { "image": "/items/swords/randomgenerated/%s/handle/1.png" % image_folder },
+                               { "image": "/items/swords/randomgenerated/%s/blade/1.png" % image_folder } ],
+            "primaryStances": item[0]["primaryStances"]
+        }
+
+        generated_sword["primaryStances"]["projectileType"] = item[0]["primaryStances"]["projectileTypes"][0]
+        generated_sword["primaryStances"]["projectile"]["level"] = 1.0
+        generated_sword["primaryStances"]["projectile"]["power"] = 5.0
+
+        if "altStances" in item[0]:
+            generated_sword["altStances"] = item[0]["altStances"]
+            generated_sword["altStances"]["projectileType"] = item[0]["altStances"]["projectileTypes"][0]
+            generated_sword["altStances"]["projectile"]["level"] = 1.0
+            generated_sword["altStances"]["projectile"]["power"] = 5.0
+
+        if "inspectionKind" in item[0]:
+            generated_sword["inspectionKind"] = item[0]["inspectionKind"]
+
+        if "rateOfFire" in item[0]:
+            generated_sword["fireTime"] = float(item[0]["rateOfFire"][0])
+
+        generated_sword["weaponType"] = item[0]["name"]
+        generated_sword["shortdescription"] = "Cheater's " + item[0]["name"]
+
+        return generated_sword
+
+    def generate_shield(self, item):
+        generated_shield = {
+            "generated": True,
+            "itemName": "generatedshield",
+            "rarity": "common",
+            "shortdescription": "Cheater's Shield",
+            "level": 1.0,
+            "levelScale": 2.0,
+            "maxStack": 1,
+            "hitSound": "/sfx/melee/shield_block_metal2.wav",
+            "inspectionKind": "",
+            "knockbackDamageKind": "",
+            "knockbackPower": 10,
+            "recoil": 0.2,
+            "damagePoly": [[-8,0], [8,18], [8,-18]],
+            "shieldPoly": [[-8,0], [-8,12], [8,20], [8,-24], [-8,-12]],
+            "statusEffects": [ { "amount": 30, "kind": "Shield" } ],
+            "drawables": [
+                { "image": "/items/shields/randomgenerated/tieredshields/tier1/images/1.png" }
+            ],
+            "inventoryIcon": [
+                { "image": "/items/shields/randomgenerated/tieredshields/tier1/images/1.png:icon" }
+            ]
+        }
+
+        #if "kind" in item[0]:
+        #    generated_shield["inspectionKind"] = item[0]["kind"]
+
+        if "shortdescription" in item[0]:
+            generated_shield["shortdescription"] = item[0]["shortdescription"]
+
+        if "rarity" in item[0]:
+            generated_shield["rarity"] = item[0]["rarity"]
+
+        if "hitSound" in item[0]:
+            generated_shield["hitSound"] = item[0]["hitSound"]
+
+        if "recoil" in item[0]["baseline"]:
+            generated_shield["recoil"] = item[0]["baseline"]["recoil"]
+
+        if "knockbackPower" in item[0]["baseline"]:
+            generated_shield["knockbackPower"] = item[0]["baseline"]["knockbackPower"]
+
+        if "knockbackDamageKind" in item[0]["baseline"]:
+            generated_shield["knockbackDamageKind"] = item[0]["baseline"]["knockbackDamageKind"]
+
+        if "statusEffects" in item[0]["baseline"]:
+            generated_shield["statusEffects"] = item[0]["baseline"]["statusEffects"]
+
+        if "shieldPoly" in item[0]["baseline"]:
+            generated_shield["shieldPoly"] = item[0]["baseline"]["shieldPoly"]
+
+        if "damagePoly" in item[0]["baseline"]:
+            generated_shield["damagePoly"] = item[0]["baseline"]["damagePoly"]
+
+        return generated_shield
+
+    def generate_sapling(self, item):
+        sapling = {
+            "foliageHueShift": -0.0,
+            "foliageName": "brains",
+            "stemHueShift": -0.0,
+            "stemName": "metal"
+        }
+
+        return sapling
+
+    def generate_filledcapturepod(self, item, player_uuid):
+        filledcapturepod = {
+            "projectileConfig": {
+                "actionOnReap": [
+                    {
+                        "action": "spawnmonster",
+                        "arguments": {
+                            "aggressive": True,
+                            "damageTeam": 0,
+                            "damageTeamType": "friendly",
+                            "familyIndex": 0,
+                            "killCount": None,
+                            "level": 1.0,
+                            "ownerUuid": player_uuid,
+                            "persistent": True,
+                            "seed": self.assets.monsters().monster_seed()
+                        },
+                        "offset": [0,2],
+                        "type": self.assets.monsters().random_monster()
+                    }
+                ],
+                "level": 7,
+                "speed": 70
+            }
+        }
+
+        return filledcapturepod
+
+class Species():
+    def __init__(self, assets):
+        self.assets = assets
+        self.starbound_folder = assets.starbound_folder
+        self.humanoid_config = self.assets.read("/humanoid.config", self.assets.vanilla_assets)
+
+    def is_species(self, key):
+        if key.endswith(".species"):
+            return True
+        else:
+            return False
+
+    def index_data(self, asset):
+        key = asset[0]
+        path = asset[1]
+        asset_data = self.assets.read(key, path)
+
+        if asset_data == None: return
+
+        if "kind" in asset_data:
+            return (key, path, "species", "", asset_data["kind"].lower(), "")
+        else:
+            logging.warning("Invalid species asset (no kind key) %s in %s" % (key, path))
+
+    def get_species_list(self):
+        """Return a formatted list of all species."""
+        c = self.assets.db.cursor()
+        c.execute("select distinct name from assets where type = 'species' order by name")
+
+        names = [x[0] for x in c.fetchall()]
+        formatted = []
+
+        for s in names:
+            if s == "dummy":
+                continue
+
+            try:
+                formatted.append(s[0].upper() + s[1:])
+            except IndexError:
+                formatted.append(s)
+                logging.exception("Unable to format species: %s", s)
+
+        return formatted
+
+    def get_species(self, name):
+        """Look up a species from the index and return contents of species files."""
+        c = self.assets.db.cursor()
+        c.execute("select * from assets where type = 'species' and name = ?", (name.lower(),))
+        species = c.fetchone()
+        if species is None:
+            # species is not indexed
+            logging.warning("Unable to load species: %s", name)
+            return None
+        species_data = self.assets.read(species[0], species[1])
+        if species_data is None:
+            # corrupt save, no race set
+            logging.warning("No race set on player")
+            return None
+        else:
+            return species, species_data
+
+    def get_appearance_data(self, name, gender, key):
+        species = self.get_species(name)
+        # there is another json extension here where strings that have a , on
+        # the end are treated as 1 item lists. there are also some species with
+        # missing keys
+        try:
+            results = self.get_gender_data(species, gender)[key]
+        except KeyError:
+            return []
+        if type(results) is str:
+            return (results,)
+        else:
+            return results
+
+    def get_facial_hair_types(self, name, gender, group):
+        return self.get_appearance_data(name, gender, "facialHair")
+
+    def get_facial_hair_groups(self, name, gender):
+        return self.get_appearance_data(name, gender, "facialHairGroup")
+
+    def get_facial_mask_types(self, name, gender, group):
+        return self.get_appearance_data(name, gender, "facialMask")
+
+    def get_facial_mask_groups(self, name, gender):
+        return self.get_appearance_data(name, gender, "facialMaskGroup")
+
+    def get_hair_types(self, name, gender, group):
+        return self.get_appearance_data(name, gender, "hair")
+
+    def get_hair_groups(self, name, gender):
+        groups = self.get_appearance_data(name, gender, "hairGroup")
+        if len(groups) == 0:
+            return ("hair",)
+        else:
+            return groups
+
+    def get_personality(self):
+        return self.humanoid_config["charGen"]["personalities"]
+
+    def get_gender_data(self, species_data, gender):
+        if gender == "male":
+            return species_data[1]["genders"][0]
+        else:
+            return species_data[1]["genders"][1]
+
+    def get_default_colors(self, species):
+        # just use first option
+        species_data = self.get_species(species)[1]
+        def val(key):
+            if key in species_data:
+                return read_default_color(species_data[key])
+            else:
+                return ""
+
+        colors = {
+            "bodyColor": val("bodyColor"),
+            "undyColor": val("undyColor"),
+            "hairColor": val("hairColor")
+        }
+        # TODO: there is an unbelievably complicated method for choosing default
+        # player colors. i'm not sure if it's worth going into too much considering
+        # it will only be used if a player switches species
+        # it might be easier to just leave this out entirely. let user add/remove
+        # their own directive colors
+        directives = {
+            "body": [colors["bodyColor"]],
+            "emote": [colors["bodyColor"], colors["undyColor"]],
+            "hair": [colors["hairColor"]],
+            "facial_hair": [colors["bodyColor"]],
+            "facial_mask": [colors["bodyColor"]]
+        }
+        return directives
+
+    def get_preview_image(self, name, gender):
+        species = self.get_species(name.lower())
+        try:
+            try:
+                key = self.get_gender_data(species, gender)["characterImage"]
+            except TypeError:
+                return None
+            return self.assets.read(key, species[0][1], image=True)
+        except FileNotFoundError:
+            # corrupt save, no race set
+            logging.warning("No race set on player")
+            return None
+
+    def render_player(self, player):
+        name = player.get_race()
+        gender = player.get_gender()
+        asset_loc = self.get_species(name)[0][1]
+
+        body_sprites = self.assets.read("/humanoid/%s/%sbody.png" % (name, gender),
+                                        asset_loc, True)
+        frontarm_sprites = self.assets.read("/humanoid/%s/frontarm.png" % name,
+                                            asset_loc, True)
+        backarm_sprites = self.assets.read("/humanoid/%s/backarm.png" % name,
+                                            asset_loc, True)
+        head_sprites = self.assets.read("/humanoid/%s/%shead.png" % (name, gender),
+                                        asset_loc, True)
+
+        body_img = Image.open(BytesIO(body_sprites)).crop((43, 0, 86, 43))
+        frontarm_img = Image.open(BytesIO(frontarm_sprites)).crop((43, 0, 86, 43))
+        backarm_img = Image.open(BytesIO(backarm_sprites)).crop((43, 0, 86, 43))
+        head_img = Image.open(BytesIO(head_sprites)).crop((43, 0, 86, 43))
+
+        hair = player.get_hair()
+        hair_img = self.get_hair_image(name, hair[0], hair[1], gender)
+
+        base = Image.new("RGBA", (43, 43))
+
+        base.paste(backarm_img)
+        base.paste(head_img, mask=head_img)
+
+        if hair_img is not None:
+            try:
+                base.paste(hair_img, mask=hair_img)
+            except ValueError:
+                logging.exception("Bad hair image: %s, %s", hair[0], hair[1])
+
+        base.paste(body_img, mask=body_img)
+        base.paste(frontarm_img, mask=frontarm_img)
+
+        return base
+
+    def get_hair_image(self, name, hair_type, hair_group, gender):
+        # TODO: bbox is from .frame file, need a way to read them still
+        species = self.get_species(name.lower())
+
+        # BUG: this will break for species mods on windows maybe?
+        image_path = "/humanoid/%s/%s/%s.png" % (name, hair_type, hair_group)
+
+        try:
+            image = self.assets.read(image_path, species[0][1], image=True)
+            return Image.open(BytesIO(image)).crop((43, 0, 86, 43))
+        except OSError:
+            logging.exception("Missing hair image: %s", image_path)
+            return
+
+class Player():
+    def __init__(self, assets):
+        self.assets = assets
+        self.starbound_folder = assets.starbound_folder
+
+        # haven't found any definitions for these in the assets
+        self.mode_types = {
+             "supernova": "Normal",
+             "blackHole": "Hardcore",
+             "bigCrunch": "Permadeath"
+        }
+
+    def get_mode_type(self, name):
+        """Return a mode type key name from its pretty name."""
+        # TODO: is there a better way to do this kinda thing?
+        for key in self.mode_types.keys():
+            if name == self.mode_types[key]:
+                return key
+
+class Monsters():
+    def __init__(self, assets):
+        self.assets = assets
+        self.starbound_folder = assets.starbound_folder
+
+    def is_monster(self, key):
+        if key.endswith(".monstertype"):
+            return True
+        else:
+            return False
+
+    def index_data(self, asset):
+        key = asset[0]
+        path = asset[1]
+        asset_data = self.assets.read(key, path)
+
+        if asset_data == None: return
+
+        if "type" in asset_data:
+            return (key, path, "monster", "", asset_data["type"], "")
+        else:
+            logging.warning("Invalid monster: %s" % key)
+
+    def all(self):
+        """Return a list of all unique monster types."""
+        c = self.assets.db.cursor()
+        c.execute("select distinct name from assets where type = 'monster' order by name")
+        return c.fetchall()
+
+    def random_monster(self):
+        """Return type of a random monster as a string."""
+        return random.choice(self.all())[0]
+
+    def monster_seed(self):
+        """Return a random monster seed as a string."""
+        # okay, so i can't figure out exactly what this should be, but this
+        # number seems to cause no crashes so far
+        return str(random.randint(1, 9999999999999999999))
+
+class Techs():
+    def __init__(self, assets):
+        self.assets = assets
+        self.starbound_folder = assets.starbound_folder
+
+    def is_tech(self, key):
+        if key.endswith(".tech"):
+            return True
+        else:
+            return False
+
+    def index_data(self, asset):
+        key = asset[0]
+        path = asset[1]
+        name = os.path.basename(asset[0]).split(".")[0]
+        asset_data = self.assets.read(key, path)
+
+        if asset_data == None: return
+
+        return (key, path, "tech", "", name, "")
+
+    def all(self):
+        """Return a list of all techs."""
+        c = self.assets.db.cursor()
+        c.execute("select name from assets where type = 'tech' order by name")
+        return [x[0] for x in c.fetchall()]
+
+    def get_tech(self, name):
+        c = self.assets.db.cursor()
+        c.execute("select key, path from assets where type = 'tech' and name = ?", (name,))
+        tech = c.fetchone()
+        info = self.assets.read(tech[0]+"item", tech[1])
+
+        icon = self.assets.read(info["inventoryIcon"], tech[1], image=True)
+
+        if icon is None:
+            icon = self.assets.items().missing_icon()
+
+        return info, Image.open(BytesIO(icon)).convert("RGBA"), tech[0]
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
+    assets = Assets("assets.db", "/opt/starbound")
+    assets.init_db()
+    logging.info("Started indexing...")
+    count = 0
+    for i in assets.create_index():
+        count += 1
+    print(count)
+    logging.info("Finished!")
